@@ -1,99 +1,183 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Windows.Forms;
+using System.Globalization;
+using MetadataExtractor.Formats.Exif;
+using MetadataDirectory = MetadataExtractor.Directory;
 
-namespace PictureDirectory
+namespace PictureDirectory;
+
+public partial class frmMain : Form
 {
-    public partial class frmMain : Form
+    private static readonly string[] SupportedExtensions =
+    [
+        ".3gp", ".mp4", ".mov", ".png", ".jpg", ".jpeg"
+    ];
+
+    public frmMain()
     {
-        public frmMain()
+        InitializeComponent();
+        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+    }
+
+    private void btnSelect_Click(object sender, EventArgs e)
+    {
+        if (fbdMain.ShowDialog() == DialogResult.OK)
         {
-            InitializeComponent();
-        }
-
-        private void btnSelect_Click(object sender, EventArgs e)
-        {
-            DialogResult result = fbdMain.ShowDialog();
-            if (result == DialogResult.OK)
-            {
-                txtDirectory.Text = fbdMain.SelectedPath;
-            }
-        }
-
-        private void btnProcess_Click(object sender, EventArgs e)
-        {
-            string[] oFiles = Directory.GetFiles(txtDirectory.Text);
-
-            foreach (string oFile in oFiles)
-            {
-                try
-                {
-                    string oFileName = System.IO.Path.GetFileName(oFile);
-                    string oExtension = System.IO.Path.GetExtension(oFile).ToLower();
-
-                    switch (oExtension)
-                    {
-                        case ".3gp":
-                        case ".mp4":
-                        case ".mov":
-                        case ".png":
-                        case ".jpg":
-                        case ".jpeg":
-                            //FileAttributes oFileAttributes = File.GetAttributes(oFile);
-
-                            DateTime oMinDateTime = DateTime.Today;
-
-                            oMinDateTime = new DateTime(Math.Min(File.GetCreationTime(oFile).Ticks, oMinDateTime.Ticks));
-                            oMinDateTime = new DateTime(Math.Min(File.GetLastAccessTime(oFile).Ticks, oMinDateTime.Ticks));
-                            oMinDateTime = new DateTime(Math.Min(File.GetLastWriteTime(oFile).Ticks, oMinDateTime.Ticks));
-
-                            IReadOnlyList<MetadataExtractor.Directory> oDirectories = MetadataExtractor.ImageMetadataReader.ReadMetadata(oFile);
-                            MetadataExtractor.Formats.Exif.ExifSubIfdDirectory oExifSubIfdDirectory = oDirectories.OfType<MetadataExtractor.Formats.Exif.ExifSubIfdDirectory>().FirstOrDefault();
-                            if (oExifSubIfdDirectory != null)
-                            {
-                                object oDateTime = oExifSubIfdDirectory.GetObject(MetadataExtractor.Formats.Exif.ExifDirectoryBase.TagDateTimeOriginal);
-                                if (oDateTime != null)
-                                {
-                                    DateTime oTagDateTimeOriginal = DateTime.ParseExact(oDateTime.ToString().Substring(0, 10), "yyyy:MM:dd", System.Threading.Thread.CurrentThread.CurrentCulture);
-                                    oMinDateTime = new DateTime(Math.Min(oTagDateTimeOriginal.Ticks, oMinDateTime.Ticks));
-                                }
-                            }
-
-                            if (oFileName.StartsWith("IMG-") || oFileName.StartsWith("VID_") || oFileName.StartsWith("VID-"))
-                            {
-                                DateTime oDateTimeWhatsapp = DateTime.Today;
-                                if (DateTime.TryParseExact(oFileName.Substring(4, 8), "yyyyMMdd", System.Threading.Thread.CurrentThread.CurrentCulture, System.Globalization.DateTimeStyles.None, out oDateTimeWhatsapp))
-                                {
-                                    oMinDateTime = new DateTime(Math.Min(oDateTimeWhatsapp.Ticks, oMinDateTime.Ticks));
-                                }
-                            }
-
-                            //Console.WriteLine(oFile + " " + oCreationTime.ToShortDateString() + " " + oLastAccessTime.ToShortDateString() + " " + oLastWriteTime.ToShortDateString());
-
-                            string oDirectory = oMinDateTime.ToString("yyyy-MM-dd");
-
-                            oDirectory = Path.Combine(txtDirectory.Text, oDirectory);
-                            if (!Directory.Exists(oDirectory)) { Directory.CreateDirectory(oDirectory); }
-
-                            Console.WriteLine(oFile + " " + oDirectory);
-
-                            string newFile = Path.Combine(oDirectory, oFileName);
-                            if (!File.Exists(newFile)) { File.Move(oFile, newFile); }
-
-                            break;
-
-                        default:
-                            break;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(ex.Message);
-                    //throw;
-                }
-            }
+            txtDirectory.Text = fbdMain.SelectedPath;
         }
     }
+
+    private async void btnProcess_Click(object sender, EventArgs e)
+    {
+        string directory = txtDirectory.Text;
+
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+        {
+            MessageBox.Show(this, "Please select a valid directory first.", "PictureDirectory",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        btnProcess.Enabled = false;
+        btnSelect.Enabled = false;
+        Cursor = Cursors.WaitCursor;
+
+        try
+        {
+            int processed = await Task.Run(() => OrganizeFiles(directory));
+            MessageBox.Show(this, $"Processed {processed} file(s).", "PictureDirectory",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        finally
+        {
+            Cursor = Cursors.Default;
+            btnProcess.Enabled = true;
+            btnSelect.Enabled = true;
+        }
+    }
+
+    private static int OrganizeFiles(string directory)
+    {
+        int processedCount = 0;
+
+        foreach (string filePath in Directory.GetFiles(directory))
+        {
+            string extension = Path.GetExtension(filePath).ToLowerInvariant();
+            if (!SupportedExtensions.Contains(extension))
+            {
+                continue;
+            }
+
+            try
+            {
+                if (MoveFileToDateDirectory(directory, filePath))
+                {
+                    processedCount++;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.WriteLine($"Failed to process '{filePath}': {ex.Message}");
+            }
+        }
+
+        return processedCount;
+    }
+
+    private static bool MoveFileToDateDirectory(string rootDirectory, string filePath)
+    {
+        string fileName = Path.GetFileName(filePath);
+        DateTime earliestDate = GetEarliestDate(filePath, fileName);
+
+        string targetDirectory = Path.Combine(rootDirectory, earliestDate.ToString("yyyy-MM-dd"));
+        Directory.CreateDirectory(targetDirectory);
+
+        string destinationPath = Path.Combine(targetDirectory, fileName);
+        if (File.Exists(destinationPath))
+        {
+            return false;
+        }
+
+        File.Move(filePath, destinationPath);
+        return true;
+    }
+
+    private static DateTime GetEarliestDate(string filePath, string fileName)
+    {
+        DateTime earliest = DateTime.Today;
+
+        earliest = Min(earliest, File.GetCreationTime(filePath));
+        earliest = Min(earliest, File.GetLastAccessTime(filePath));
+        earliest = Min(earliest, File.GetLastWriteTime(filePath));
+
+        DateTime? exifDate = TryGetExifDate(filePath);
+        if (exifDate.HasValue)
+        {
+            earliest = Min(earliest, exifDate.Value);
+        }
+
+        DateTime? whatsappDate = TryGetWhatsappDate(fileName);
+        if (whatsappDate.HasValue)
+        {
+            earliest = Min(earliest, whatsappDate.Value);
+        }
+
+        return earliest;
+    }
+
+    private static DateTime? TryGetExifDate(string filePath)
+    {
+        try
+        {
+            IReadOnlyList<MetadataDirectory> directories = MetadataExtractor.ImageMetadataReader.ReadMetadata(filePath);
+            ExifSubIfdDirectory? exifSubIfd = directories.OfType<ExifSubIfdDirectory>().FirstOrDefault();
+            object? dateTimeValue = exifSubIfd?.GetObject(ExifDirectoryBase.TagDateTimeOriginal);
+
+            if (dateTimeValue is null)
+            {
+                return null;
+            }
+
+            string dateText = dateTimeValue.ToString() ?? string.Empty;
+            if (dateText.Length < 10)
+            {
+                return null;
+            }
+
+            if (DateTime.TryParseExact(dateText[..10], "yyyy:MM:dd", CultureInfo.InvariantCulture,
+                DateTimeStyles.None, out DateTime parsed))
+            {
+                return parsed;
+            }
+        }
+        catch (Exception ex) when (ex is MetadataExtractor.ImageProcessingException or IOException)
+        {
+            // No readable metadata (e.g. video files, corrupt/unsupported images) - fall back to file timestamps.
+        }
+
+        return null;
+    }
+
+    private static DateTime? TryGetWhatsappDate(string fileName)
+    {
+        if (!fileName.StartsWith("IMG-", StringComparison.Ordinal) &&
+            !fileName.StartsWith("VID_", StringComparison.Ordinal) &&
+            !fileName.StartsWith("VID-", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        if (fileName.Length < 12)
+        {
+            return null;
+        }
+
+        if (DateTime.TryParseExact(fileName.Substring(4, 8), "yyyyMMdd", CultureInfo.InvariantCulture,
+            DateTimeStyles.None, out DateTime parsed))
+        {
+            return parsed;
+        }
+
+        return null;
+    }
+
+    private static DateTime Min(DateTime a, DateTime b) => a < b ? a : b;
 }
